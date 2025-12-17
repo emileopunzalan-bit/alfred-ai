@@ -5,8 +5,18 @@ from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from contextlib import asynccontextmanager
 import io
 import os
+import sys
 from pathlib import Path
 from openai import OpenAI
+
+# Load local .env for development, but never during pytest runs.
+if "pytest" not in sys.modules:
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv()
+    except Exception:
+        pass
 
 from .brain import think
 from .memory import load_memory, save_memory

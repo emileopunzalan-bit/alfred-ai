@@ -1,9 +1,12 @@
 import os
+import sys
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
+# Load local .env for development, but never during pytest runs.
+if "pytest" not in sys.modules:
+    load_dotenv()
 
 API_KEY = os.getenv("OPENAI_API_KEY")
 USE_REAL_OPENAI = bool(API_KEY)
