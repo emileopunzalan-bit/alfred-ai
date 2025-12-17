@@ -84,6 +84,7 @@
 
   <form id="chat-form">
     <button type="button" id="mic-btn" title="Hold to talk">🎤</button>
+    <button type="button" id="handsfree-btn" title="Toggle hands-free listening">Hands‑free: Off</button>
     <input id="message" type="text" placeholder="Talk to Alfred..." autocomplete="off" />
     <button type="button" id="stop-tts-btn" title="Stop speaking" disabled>Stop</button>
     <button type="button" id="pause-tts-btn" title="Pause speaking" disabled>Pause</button>
@@ -100,6 +101,7 @@
   const input = document.getElementById("message");
   const button = form.querySelector('button[type="submit"]');
   const micBtn = document.getElementById("mic-btn");
+  const handsFreeBtn = document.getElementById("handsfree-btn");
   const stopTtsBtn = document.getElementById("stop-tts-btn");
   const pauseTtsBtn = document.getElementById("pause-tts-btn");
   const resumeTtsBtn = document.getElementById("resume-tts-btn");
@@ -176,6 +178,21 @@
     const pausePhrases = new Set(["pause", "pause speaking", "pause tts"]);
     const resumePhrases = new Set(["continue", "resume", "continue speaking", "resume speaking", "continue tts", "resume tts"]);
 
+    const handsFreeOnPhrases = new Set([
+      "hands free on",
+      "handsfree on",
+      "hands-free on",
+      "enable hands free",
+      "enable handsfree",
+    ]);
+    const handsFreeOffPhrases = new Set([
+      "hands free off",
+      "handsfree off",
+      "hands-free off",
+      "disable hands free",
+      "disable handsfree",
+    ]);
+
     if (stopPhrases.has(t)) {
       stopTts();
       return true;
@@ -189,12 +206,70 @@
       resumeTts();
       return true;
     }
+
+    if (handsFreeOnPhrases.has(t)) {
+      setHandsFree(true);
+      return true;
+    }
+
+    if (handsFreeOffPhrases.has(t)) {
+      setHandsFree(false);
+      return true;
+    }
+
     return false;
   }
 
   let recorder = null;
   let recording = false;
   let chunks = [];
+
+  // Hands-free mode (wake word: "yow alfred")
+  const WAKE_PHRASE = "yow alfred";
+  let handsFreeEnabled = false;
+  let handsFreeStream = null;
+  let handsFreeLoopBusy = false;
+  let handsFreeNextIsCommand = false;
+
+  // Simple voice activity detection (VAD) to avoid calling /stt when the mic is silent.
+  let handsFreeAudioCtx = null;
+  let handsFreeAnalyser = null;
+  let handsFreeSource = null;
+
+  function getRmsLevel(analyser) {
+    const data = new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(data);
+    let sumSq = 0;
+    for (let i = 0; i < data.length; i++) {
+      const v = (data[i] - 128) / 128;
+      sumSq += v * v;
+    }
+    return Math.sqrt(sumSq / data.length);
+  }
+
+  async function isLikelySpeech() {
+    if (!handsFreeAnalyser) return true;
+    // Sample a few frames.
+    let max = 0;
+    for (let i = 0; i < 4; i++) {
+      max = Math.max(max, getRmsLevel(handsFreeAnalyser));
+      await new Promise((r) => setTimeout(r, 40));
+    }
+    // Threshold tuned to be conservative; adjust if too sensitive.
+    return max > 0.02;
+  }
+
+  function updateHandsFreeUi() {
+    handsFreeBtn.textContent = handsFreeEnabled ? "Hands‑free: On" : "Hands‑free: Off";
+    handsFreeBtn.title = handsFreeEnabled
+      ? `Hands‑free listening is ON (wake phrase: \"${WAKE_PHRASE}\")`
+      : "Toggle hands-free listening";
+
+    micBtn.disabled = handsFreeEnabled;
+    if (!recording) {
+      micBtn.title = handsFreeEnabled ? "Hands‑free is on (use wake phrase)" : "Click to record";
+    }
+  }
 
   function addBubble(text, role) {
     const div = document.createElement("div");
@@ -325,6 +400,166 @@
     return res.json();
   }
 
+  async function recordOnceFromStream(stream, durationMs) {
+    return new Promise((resolve, reject) => {
+      let localChunks = [];
+      let localRecorder;
+      try {
+        localRecorder = new MediaRecorder(stream);
+      } catch (e) {
+        reject(e);
+        return;
+      }
+
+      localRecorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) localChunks.push(e.data);
+      };
+      localRecorder.onerror = (e) => reject(e);
+      localRecorder.onstop = () => {
+        const blob = new Blob(localChunks, { type: localRecorder.mimeType || "audio/webm" });
+        resolve(blob);
+      };
+
+      localRecorder.start();
+      setTimeout(() => {
+        try {
+          localRecorder.stop();
+        } catch (e) {
+          reject(e);
+        }
+      }, durationMs);
+    });
+  }
+
+  function extractWakeMessage(transcriptLower) {
+    // Accept small variations like "yo alfred" or "yoww alfred".
+    const re = /\byo+w\s+alfred\b/i;
+    const m = transcriptLower.match(re);
+    if (!m) return null;
+    const idx = transcriptLower.indexOf(m[0].toLowerCase());
+    const after = transcriptLower.slice(idx + m[0].length).trim();
+    return { wake: m[0], after };
+  }
+
+  async function handsFreeLoop() {
+    if (!handsFreeEnabled || !handsFreeStream || handsFreeLoopBusy) return;
+    handsFreeLoopBusy = true;
+    try {
+      // When not actively expecting a command, avoid calling /stt during silence.
+      if (!handsFreeNextIsCommand) {
+        const likelySpeech = await isLikelySpeech();
+        if (!likelySpeech) return;
+      }
+
+      const blob = await recordOnceFromStream(handsFreeStream, 1200);
+      const data = await sttFromBlob(blob, "handsfree.webm");
+      const transcript = (data && data.text ? String(data.text) : "").trim();
+      const transcriptLower = transcript.toLowerCase();
+
+      if (!transcript) return;
+
+      // Voice commands should work anytime.
+      if (handleVoiceControlCommand(transcript)) return;
+
+      // If we already heard the wake word, next transcript becomes the command.
+      if (handsFreeNextIsCommand) {
+        handsFreeNextIsCommand = false;
+        input.value = transcript;
+        form.dispatchEvent(new Event("submit"));
+        return;
+      }
+
+      // Wake word routing.
+      const wake = extractWakeMessage(transcriptLower);
+      if (!wake) return;
+
+      // If the user said: "yow alfred <message>", use the remainder.
+      if (wake.after) {
+        input.value = transcript.replace(new RegExp(wake.wake, "i"), "").trim();
+        if (input.value) form.dispatchEvent(new Event("submit"));
+        return;
+      }
+
+      // If only wake phrase was detected, treat the next chunk as the command.
+      handsFreeNextIsCommand = true;
+    } catch (err) {
+      console.error("Hands-free STT loop error:", err);
+      setHandsFree(false);
+      addBubble("⚠️ Hands‑free stopped (STT error).", "alfred");
+    } finally {
+      handsFreeLoopBusy = false;
+      if (handsFreeEnabled) {
+        setTimeout(handsFreeLoop, 400);
+      }
+    }
+  }
+
+  async function setHandsFree(enabled) {
+    if (enabled === handsFreeEnabled) return;
+
+    if (enabled) {
+      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+        addBubble("⚠️ Hands‑free not supported in this browser.", "alfred");
+        return;
+      }
+
+      try {
+        // Stop any manual recording first.
+        if (recorder && recording) {
+          try { recorder.stop(); } catch (e) {}
+        }
+
+        handsFreeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // Set up analyser for a simple volume check.
+        try {
+          handsFreeAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+          handsFreeSource = handsFreeAudioCtx.createMediaStreamSource(handsFreeStream);
+          handsFreeAnalyser = handsFreeAudioCtx.createAnalyser();
+          handsFreeAnalyser.fftSize = 1024;
+          handsFreeSource.connect(handsFreeAnalyser);
+          await handsFreeAudioCtx.resume();
+        } catch (e) {
+          // If WebAudio fails, we still can run hands-free without VAD.
+          handsFreeAudioCtx = null;
+          handsFreeSource = null;
+          handsFreeAnalyser = null;
+        }
+
+        handsFreeEnabled = true;
+        handsFreeNextIsCommand = false;
+        updateHandsFreeUi();
+        handsFreeLoop();
+      } catch (err) {
+        console.error("Hands-free mic permission error:", err);
+        addBubble("⚠️ Microphone permission denied.", "alfred");
+        handsFreeEnabled = false;
+        handsFreeStream = null;
+        updateHandsFreeUi();
+      }
+      return;
+    }
+
+    // disable
+    handsFreeEnabled = false;
+    handsFreeNextIsCommand = false;
+    try {
+      if (handsFreeAudioCtx) {
+        handsFreeAudioCtx.close();
+      }
+    } catch (e) {}
+    handsFreeAudioCtx = null;
+    handsFreeSource = null;
+    handsFreeAnalyser = null;
+    try {
+      if (handsFreeStream) {
+        handsFreeStream.getTracks().forEach((t) => t.stop());
+      }
+    } catch (e) {}
+    handsFreeStream = null;
+    updateHandsFreeUi();
+  }
+
   async function startRecording() {
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       micBtn.disabled = true;
@@ -391,9 +626,58 @@
     }
   });
 
+  handsFreeBtn.addEventListener("click", async () => {
+    await setHandsFree(!handsFreeEnabled);
+  });
+
+  // Gesture: double-click / double-tap header toggles hands-free.
+  (function initHandsFreeGesture() {
+    const headerEl = document.querySelector("header");
+    if (!headerEl) return;
+
+    headerEl.addEventListener("dblclick", () => setHandsFree(!handsFreeEnabled));
+
+    let lastTap = 0;
+    headerEl.addEventListener(
+      "touchend",
+      () => {
+        const now = Date.now();
+        if (now - lastTap < 350) {
+          setHandsFree(!handsFreeEnabled);
+          lastTap = 0;
+        } else {
+          lastTap = now;
+        }
+      },
+      { passive: true }
+    );
+  })();
+
+  // Keyboard accessibility (when not typing):
+  // - Esc: stop speaking
+  // - P: pause
+  // - R: resume
+  // - H: toggle hands-free
+  document.addEventListener("keydown", (e) => {
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
+    const typing = tag === "input" || tag === "textarea";
+    if (typing) return;
+
+    if (e.key === "Escape") {
+      stopTts();
+    } else if (e.key === "p" || e.key === "P") {
+      pauseTts();
+    } else if (e.key === "r" || e.key === "R") {
+      resumeTts();
+    } else if (e.key === "h" || e.key === "H") {
+      setHandsFree(!handsFreeEnabled);
+    }
+  });
+
   // Init
   setMicUiActive(false);
   setTtsControls({ active: false, paused: false });
+  updateHandsFreeUi();
   addBubble("Hello, I'm Alfred. You can type or tap 🎤 to talk to me.", "alfred");
   </script>
 </body>
