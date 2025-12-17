@@ -85,19 +85,116 @@
   <form id="chat-form">
     <button type="button" id="mic-btn" title="Hold to talk">🎤</button>
     <input id="message" type="text" placeholder="Talk to Alfred..." autocomplete="off" />
+    <button type="button" id="stop-tts-btn" title="Stop speaking" disabled>Stop</button>
+    <button type="button" id="pause-tts-btn" title="Pause speaking" disabled>Pause</button>
+    <button type="button" id="resume-tts-btn" title="Continue speaking" disabled>Continue</button>
     <button type="submit">Send</button>
   </form>
 
   <script>
-  const API_BASE = "http://127.0.0.1:8000";
+  const API_BASE = (window.location.origin && window.location.origin !== "null")
+    ? window.location.origin
+    : "http://127.0.0.1:8000";
   const chat = document.getElementById("chat");
   const form = document.getElementById("chat-form");
   const input = document.getElementById("message");
   const button = form.querySelector('button[type="submit"]');
   const micBtn = document.getElementById("mic-btn");
+  const stopTtsBtn = document.getElementById("stop-tts-btn");
+  const pauseTtsBtn = document.getElementById("pause-tts-btn");
+  const resumeTtsBtn = document.getElementById("resume-tts-btn");
 
-  let recognition = null;
-  let listening = false;
+  let currentAudio = null;
+  let currentAudioUrl = null;
+
+  function setTtsControls({ active, paused }) {
+    stopTtsBtn.disabled = !active;
+    pauseTtsBtn.disabled = !active || paused;
+    resumeTtsBtn.disabled = !active || !paused;
+  }
+
+  function stopTts() {
+    try {
+      if ("speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+        currentAudio = null;
+      }
+      if (currentAudioUrl) {
+        URL.revokeObjectURL(currentAudioUrl);
+        currentAudioUrl = null;
+      }
+    } finally {
+      setTtsControls({ active: false, paused: false });
+    }
+  }
+
+  function pauseTts() {
+    let paused = false;
+    try {
+      if ("speechSynthesis" in window && window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
+        window.speechSynthesis.pause();
+        paused = true;
+      } else if (currentAudio && !currentAudio.paused) {
+        currentAudio.pause();
+        paused = true;
+      }
+    } finally {
+      if (stopTtsBtn.disabled === false) {
+        setTtsControls({ active: true, paused });
+      }
+    }
+  }
+
+  async function resumeTts() {
+    let paused = false;
+    try {
+      if ("speechSynthesis" in window && window.speechSynthesis.paused) {
+        window.speechSynthesis.resume();
+        paused = false;
+      } else if (currentAudio && currentAudio.paused) {
+        await currentAudio.play();
+        paused = false;
+      }
+    } catch (e) {
+      // fall through
+    } finally {
+      if (stopTtsBtn.disabled === false) {
+        setTtsControls({ active: true, paused });
+      }
+    }
+  }
+
+  function handleVoiceControlCommand(transcriptRaw) {
+    const t = (transcriptRaw || "").trim().toLowerCase();
+    if (!t) return false;
+
+    const stopPhrases = new Set(["stop", "stop speaking", "stop tts"]);
+    const pausePhrases = new Set(["pause", "pause speaking", "pause tts"]);
+    const resumePhrases = new Set(["continue", "resume", "continue speaking", "resume speaking", "continue tts", "resume tts"]);
+
+    if (stopPhrases.has(t)) {
+      stopTts();
+      return true;
+    }
+    if (pausePhrases.has(t)) {
+      pauseTts();
+      return true;
+    }
+    if (resumePhrases.has(t)) {
+      // resume can be async; fire-and-forget for UI
+      resumeTts();
+      return true;
+    }
+    return false;
+  }
+
+  let recorder = null;
+  let recording = false;
+  let chunks = [];
 
   function addBubble(text, role) {
     const div = document.createElement("div");
@@ -108,6 +205,10 @@
   }
 
   async function playAlfredVoice(text) {
+    // Always stop any existing playback first
+    stopTts();
+    setTtsControls({ active: true, paused: false });
+
     // Prefer browser TTS when available to avoid server API usage during development
     if ("speechSynthesis" in window) {
       try {
@@ -115,7 +216,8 @@
         // Optional: tune voice, rate, pitch
         utter.lang = "en-US";
         utter.rate = 1.0;
-        window.speechSynthesis.cancel();
+        utter.onend = () => setTtsControls({ active: false, paused: false });
+        utter.onerror = () => setTtsControls({ active: false, paused: false });
         window.speechSynthesis.speak(utter);
         return;
       } catch (err) {
@@ -137,13 +239,34 @@
       }
 
       const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audio.play();
+      currentAudioUrl = URL.createObjectURL(blob);
+      currentAudio = new Audio(currentAudioUrl);
+      currentAudio.onended = () => {
+        setTtsControls({ active: false, paused: false });
+        try {
+          if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
+        } catch (e) {}
+        currentAudioUrl = null;
+        currentAudio = null;
+      };
+      await currentAudio.play();
     } catch (err) {
       console.error("Error playing TTS:", err);
+      setTtsControls({ active: false, paused: false });
     }
   }
+
+  stopTtsBtn.addEventListener("click", () => {
+    stopTts();
+  });
+
+  pauseTtsBtn.addEventListener("click", () => {
+    pauseTts();
+  });
+
+  resumeTtsBtn.addEventListener("click", () => {
+    resumeTts();
+  });
 
   form.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -173,59 +296,104 @@
     }
   });
 
-  // ---- Voice input using browser SpeechRecognition ----
-  function initSpeech() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      console.warn("SpeechRecognition not supported in this browser.");
+  // ---- Voice input using API /stt via MediaRecorder ----
+  function setMicUiActive(active) {
+    recording = active;
+    if (active) {
+      micBtn.classList.add("listening");
+      micBtn.textContent = "●";
+      micBtn.title = "Click to stop recording";
+    } else {
+      micBtn.classList.remove("listening");
+      micBtn.textContent = "🎤";
+      micBtn.title = "Click to record";
+    }
+  }
+
+  async function sttFromBlob(blob, filename) {
+    const fd = new FormData();
+    fd.append("audio", blob, filename);
+
+    const res = await fetch(`${API_BASE}/stt`, {
+      method: "POST",
+      body: fd,
+    });
+
+    if (!res.ok) {
+      throw new Error(await res.text());
+    }
+    return res.json();
+  }
+
+  async function startRecording() {
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       micBtn.disabled = true;
-      micBtn.title = "Voice input not supported in this browser";
+      micBtn.title = "Voice recording not supported in this browser";
       return;
     }
 
-    recognition = new SR();
-    recognition.lang = "en-US"; // you can change to "en-PH" or others
-    recognition.interimResults = false;
-    recognition.maxAlternatives = 1;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    chunks = [];
+    recorder = new MediaRecorder(stream);
 
-    recognition.onstart = () => {
-      listening = true;
-      micBtn.classList.add("listening");
-      micBtn.textContent = "●";
+    recorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) chunks.push(e.data);
     };
 
-    recognition.onend = () => {
-      listening = false;
-      micBtn.classList.remove("listening");
-      micBtn.textContent = "🎤";
+    recorder.onstop = async () => {
+      try {
+        stream.getTracks().forEach((t) => t.stop());
+        const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+        const data = await sttFromBlob(blob, "mic.webm");
+        const transcript = (data && data.text ? String(data.text) : "").trim();
+        if (!transcript) {
+          addBubble("⚠️ No transcript returned.", "alfred");
+          return;
+        }
+
+        // Voice-operated equivalents: allow voice control of TTS playback.
+        if (handleVoiceControlCommand(transcript)) {
+          return;
+        }
+
+        input.value = transcript;
+        form.dispatchEvent(new Event("submit"));
+      } catch (err) {
+        console.error("STT error:", err);
+        addBubble("⚠️ Error transcribing audio (STT).", "alfred");
+      } finally {
+        setMicUiActive(false);
+        recorder = null;
+      }
     };
 
-    recognition.onerror = (event) => {
-      console.error("Speech recognition error:", event.error);
-      listening = false;
-      micBtn.classList.remove("listening");
-      micBtn.textContent = "🎤";
-    };
-
-    recognition.onresult = (event) => {
-      const transcript = event.results[0][0].transcript;
-      input.value = transcript;
-      // Auto-send after speaking
-      form.dispatchEvent(new Event("submit"));
-    };
+    recorder.start();
+    setMicUiActive(true);
   }
 
-  micBtn.addEventListener("click", () => {
-    if (!recognition) return;
-    if (!listening) {
-      recognition.start();
-    } else {
-      recognition.stop();
+  function stopRecording() {
+    if (recorder && recording) {
+      recorder.stop();
+    }
+  }
+
+  micBtn.addEventListener("click", async () => {
+    try {
+      if (!recording) {
+        await startRecording();
+      } else {
+        stopRecording();
+      }
+    } catch (err) {
+      console.error("Mic error:", err);
+      setMicUiActive(false);
+      addBubble("⚠️ Microphone permission or recording failed.", "alfred");
     }
   });
 
   // Init
-  initSpeech();
+  setMicUiActive(false);
+  setTtsControls({ active: false, paused: false });
   addBubble("Hello, I'm Alfred. You can type or tap 🎤 to talk to me.", "alfred");
   </script>
 </body>
