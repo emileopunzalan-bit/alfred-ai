@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+*.pyd
+*.db
+alfred.db
+.DS_Store
+.idea/
+.vscode/
+node_modules/
+.expo/
+.expo-shared/
+npm-debug.log*
+yarn-error.log*
+package-lock.json

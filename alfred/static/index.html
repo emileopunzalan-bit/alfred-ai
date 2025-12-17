@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Alfred Global Assistant</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+      margin: 0;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    header {
+      padding: 12px 16px;
+      background: #020617;
+      border-bottom: 1px solid #1f2937;
+      font-weight: 600;
+      font-size: 18px;
+    }
+    #chat {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+    }
+    .bubble {
+      max-width: 80%;
+      padding: 10px 12px;
+      border-radius: 12px;
+      margin-bottom: 8px;
+      line-height: 1.4;
+      font-size: 14px;
+      white-space: pre-wrap;
+    }
+    .user {
+      background: #22c55e;
+      color: #022c22;
+      margin-left: auto;
+      border-bottom-right-radius: 2px;
+    }
+    .alfred {
+      background: #111827;
+      border: 1px solid #1f2937;
+      margin-right: auto;
+      border-bottom-left-radius: 2px;
+    }
+    form {
+      display: flex;
+      padding: 10px;
+      border-top: 1px solid #1f2937;
+      background: #020617;
+      gap: 8px;
+    }
+    input[type="text"] {
+      flex: 1;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #e5e7eb;
+      outline: none;
+    }
+    button {
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: none;
+      background: #22c55e;
+      color: #022c22;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+  </style>
+</head>
+<body>
+  <header>Alfred Global Assistant</header>
+  <div id="chat"></div>
+
+  <form id="chat-form">
+    <button type="button" id="mic-btn" title="Hold to talk">🎤</button>
+    <input id="message" type="text" placeholder="Talk to Alfred..." autocomplete="off" />
+    <button type="submit">Send</button>
+  </form>
+
+  <script>
+  const API_BASE = "http://127.0.0.1:8000";
+  const chat = document.getElementById("chat");
+  const form = document.getElementById("chat-form");
+  const input = document.getElementById("message");
+  const button = form.querySelector('button[type="submit"]');
+  const micBtn = document.getElementById("mic-btn");
+
+  let recognition = null;
+  let listening = false;
+
+  function addBubble(text, role) {
+    const div = document.createElement("div");
+    div.className = `bubble ${role}`;
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  async function playAlfredVoice(text) {
+    // Prefer browser TTS when available to avoid server API usage during development
+    if ("speechSynthesis" in window) {
+      try {
+        const utter = new SpeechSynthesisUtterance(text);
+        // Optional: tune voice, rate, pitch
+        utter.lang = "en-US";
+        utter.rate = 1.0;
+        window.speechSynthesis.cancel();
+        window.speechSynthesis.speak(utter);
+        return;
+      } catch (err) {
+        console.warn("Browser TTS failed, falling back to server TTS:", err);
+      }
+    }
+
+    // Fallback: server-side TTS (requires OPENAI_API_KEY and server support)
+    try {
+      const res = await fetch(`${API_BASE}/tts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text, voice: "alloy", format: "mp3" }),
+      });
+
+      if (!res.ok) {
+        console.error("TTS error:", await res.text());
+        return;
+      }
+
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audio.play();
+    } catch (err) {
+      console.error("Error playing TTS:", err);
+    }
+  }
+
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+
+    addBubble(text, "user");
+    input.value = "";
+    input.focus();
+    button.disabled = true;
+
+    try {
+      const res = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: "default", message: text }),
+      });
+      const data = await res.json();
+      addBubble(data.reply, "alfred");
+      // Trigger Alfred's voice
+      playAlfredVoice(data.reply);
+    } catch (err) {
+      addBubble("⚠️ Error talking to Alfred API.", "alfred");
+      console.error(err);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  // ---- Voice input using browser SpeechRecognition ----
+  function initSpeech() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      console.warn("SpeechRecognition not supported in this browser.");
+      micBtn.disabled = true;
+      micBtn.title = "Voice input not supported in this browser";
+      return;
+    }
+
+    recognition = new SR();
+    recognition.lang = "en-US"; // you can change to "en-PH" or others
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+
+    recognition.onstart = () => {
+      listening = true;
+      micBtn.classList.add("listening");
+      micBtn.textContent = "●";
+    };
+
+    recognition.onend = () => {
+      listening = false;
+      micBtn.classList.remove("listening");
+      micBtn.textContent = "🎤";
+    };
+
+    recognition.onerror = (event) => {
+      console.error("Speech recognition error:", event.error);
+      listening = false;
+      micBtn.classList.remove("listening");
+      micBtn.textContent = "🎤";
+    };
+
+    recognition.onresult = (event) => {
+      const transcript = event.results[0][0].transcript;
+      input.value = transcript;
+      // Auto-send after speaking
+      form.dispatchEvent(new Event("submit"));
+    };
+  }
+
+  micBtn.addEventListener("click", () => {
+    if (!recognition) return;
+    if (!listening) {
+      recognition.start();
+    } else {
+      recognition.stop();
+    }
+  });
+
+  // Init
+  initSpeech();
+  addBubble("Hello, I'm Alfred. You can type or tap 🎤 to talk to me.", "alfred");
+  </script>
+</body>
+</html>
