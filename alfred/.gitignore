@@ -13,5 +13,19 @@ __pycache__/
 *.db
 alfred_memory.json
 
+# SQLite WAL/SHM
+*.db-wal
+*.db-shm
+
+# Node/TS build output
+app/dist/
+
+# Runtime logs
+*.log
+uvicorn*.out.log
+uvicorn*.err.log
+uvicorn.out.log
+uvicorn.err.log
+
 # Generated audio
 *.mp3

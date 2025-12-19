@@ -1,6 +1,22 @@
 {
   "type": "module",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "typecheck": "tsc -p tsconfig.json"
+  },
   "dependencies": {
-    "openai": "^6.10.0"
+    "better-sqlite3": "^12.5.0",
+    "express": "^5.2.1",
+    "openai": "^6.10.0",
+    "uuid": "^13.0.0",
+    "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.6",
+    "@types/node": "^25.0.3",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
   }
 }
