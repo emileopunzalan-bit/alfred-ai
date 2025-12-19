@@ -63,6 +63,30 @@
       color: #e5e7eb;
       outline: none;
     }
+    select {
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid #374151;
+      background: #020617;
+      color: #e5e7eb;
+      outline: none;
+      max-width: 220px;
+    }
+    #mic-meter {
+      height: 10px;
+      width: 90px;
+      border-radius: 999px;
+      border: 1px solid #374151;
+      background: #020617;
+      overflow: hidden;
+      align-self: center;
+    }
+    #mic-meter > div {
+      height: 100%;
+      width: 0%;
+      background: #22c55e;
+      transition: width 0.08s linear;
+    }
     button {
       padding: 8px 16px;
       border-radius: 999px;
@@ -85,6 +109,10 @@
   <form id="chat-form">
     <button type="button" id="mic-btn" title="Hold to talk">🎤</button>
     <button type="button" id="handsfree-btn" title="Toggle hands-free listening">Hands‑free: Off</button>
+    <select id="mic-device" title="Select microphone">
+      <option value="">Mic: Default</option>
+    </select>
+    <div id="mic-meter" title="Mic level (hands-free)"><div></div></div>
     <input id="message" type="text" placeholder="Talk to Alfred..." autocomplete="off" />
     <button type="button" id="stop-tts-btn" title="Stop speaking" disabled>Stop</button>
     <button type="button" id="pause-tts-btn" title="Pause speaking" disabled>Pause</button>
@@ -102,6 +130,9 @@
   const button = form.querySelector('button[type="submit"]');
   const micBtn = document.getElementById("mic-btn");
   const handsFreeBtn = document.getElementById("handsfree-btn");
+  const micDeviceSelect = document.getElementById("mic-device");
+  const micMeter = document.getElementById("mic-meter");
+  const micMeterFill = micMeter ? micMeter.querySelector("div") : null;
   const stopTtsBtn = document.getElementById("stop-tts-btn");
   const pauseTtsBtn = document.getElementById("pause-tts-btn");
   const resumeTtsBtn = document.getElementById("resume-tts-btn");
@@ -178,21 +209,6 @@
     const pausePhrases = new Set(["pause", "pause speaking", "pause tts"]);
     const resumePhrases = new Set(["continue", "resume", "continue speaking", "resume speaking", "continue tts", "resume tts"]);
 
-    const handsFreeOnPhrases = new Set([
-      "hands free on",
-      "handsfree on",
-      "hands-free on",
-      "enable hands free",
-      "enable handsfree",
-    ]);
-    const handsFreeOffPhrases = new Set([
-      "hands free off",
-      "handsfree off",
-      "hands-free off",
-      "disable hands free",
-      "disable handsfree",
-    ]);
-
     if (stopPhrases.has(t)) {
       stopTts();
       return true;
@@ -206,17 +222,6 @@
       resumeTts();
       return true;
     }
-
-    if (handsFreeOnPhrases.has(t)) {
-      setHandsFree(true);
-      return true;
-    }
-
-    if (handsFreeOffPhrases.has(t)) {
-      setHandsFree(false);
-      return true;
-    }
-
     return false;
   }
 
@@ -224,17 +229,119 @@
   let recording = false;
   let chunks = [];
 
+  // Mic device selection (helps fix "permission works but audio is silent" on Windows)
+  const MIC_DEVICE_STORAGE_KEY = "alfred_mic_device_id";
+  let selectedMicDeviceId = "";
+
+  function buildAudioConstraints() {
+    const audio = {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    };
+    if (selectedMicDeviceId) {
+      audio.deviceId = { exact: selectedMicDeviceId };
+    }
+    return audio;
+  }
+
+  async function refreshMicDeviceList() {
+    if (!navigator.mediaDevices?.enumerateDevices) return;
+    let devices = [];
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } catch (e) {
+      return;
+    }
+    const inputs = devices.filter((d) => d && d.kind === "audioinput");
+
+    const currentValue = micDeviceSelect.value;
+    micDeviceSelect.innerHTML = "";
+
+    const optDefault = document.createElement("option");
+    optDefault.value = "";
+    optDefault.textContent = "Mic: Default";
+    micDeviceSelect.appendChild(optDefault);
+
+    for (const d of inputs) {
+      const opt = document.createElement("option");
+      opt.value = d.deviceId || "";
+      opt.textContent = d.label ? `Mic: ${d.label}` : "Mic: (permission needed to show names)";
+      micDeviceSelect.appendChild(opt);
+    }
+
+    // Try to keep selection stable.
+    const preferred = selectedMicDeviceId || currentValue;
+    if (preferred && Array.from(micDeviceSelect.options).some((o) => o.value === preferred)) {
+      micDeviceSelect.value = preferred;
+    } else {
+      micDeviceSelect.value = "";
+      selectedMicDeviceId = "";
+      try { localStorage.removeItem(MIC_DEVICE_STORAGE_KEY); } catch (e) {}
+    }
+  }
+
   // Hands-free mode (wake word: "yow alfred")
   const WAKE_PHRASE = "yow alfred";
   let handsFreeEnabled = false;
   let handsFreeStream = null;
   let handsFreeLoopBusy = false;
   let handsFreeNextIsCommand = false;
+  let handsFreeBackoffMs = 500;
 
-  // Simple voice activity detection (VAD) to avoid calling /stt when the mic is silent.
+  // Hands-free diagnostics / silence detection
   let handsFreeAudioCtx = null;
   let handsFreeAnalyser = null;
   let handsFreeSource = null;
+  let handsFreeSilentStreak = 0;
+  let lastHandsFreeDiagAt = 0;
+  let handsFreeMeterRaf = 0;
+
+  function addBubble(text, role) {
+    const div = document.createElement("div");
+    div.className = `bubble ${role}`;
+    div.textContent = text;
+    chat.appendChild(div);
+    chat.scrollTop = chat.scrollHeight;
+  }
+
+  function updateHandsFreeUi() {
+    handsFreeBtn.textContent = handsFreeEnabled ? "Hands‑free: On" : "Hands‑free: Off";
+    handsFreeBtn.title = handsFreeEnabled
+      ? `Hands‑free listening is ON (wake phrase: "${WAKE_PHRASE}")`
+      : "Toggle hands-free listening";
+    micBtn.disabled = handsFreeEnabled;
+    if (micMeter) micMeter.style.opacity = handsFreeEnabled ? "1" : "0.55";
+  }
+
+  function ensureMicSecureContext() {
+    // Localhost is generally OK, but non-localhost HTTP can block mic.
+    if (window.isSecureContext) return true;
+    const origin = (window.location && window.location.origin) ? window.location.origin : "(unknown origin)";
+    addBubble(`⚠️ Microphone blocked: not a secure context. Use HTTPS or localhost. Current origin: ${origin}`, "alfred");
+    return false;
+  }
+
+  function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function pickMediaRecorderMimeType() {
+    if (!window.MediaRecorder || typeof MediaRecorder.isTypeSupported !== "function") return "";
+    const candidates = [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/ogg",
+      "audio/mp4",
+    ];
+    for (const t of candidates) {
+      try {
+        if (MediaRecorder.isTypeSupported(t)) return t;
+      } catch (e) {}
+    }
+    return "";
+  }
 
   function getRmsLevel(analyser) {
     const data = new Uint8Array(analyser.fftSize);
@@ -247,36 +354,88 @@
     return Math.sqrt(sumSq / data.length);
   }
 
-  async function isLikelySpeech() {
-    if (!handsFreeAnalyser) return true;
-    // Sample a few frames.
+  async function sampleMaxRms(durationMs) {
+    if (!handsFreeAnalyser) return null;
+    const steps = Math.max(1, Math.floor(durationMs / 40));
     let max = 0;
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < steps; i++) {
       max = Math.max(max, getRmsLevel(handsFreeAnalyser));
       await new Promise((r) => setTimeout(r, 40));
     }
-    // Threshold tuned to be conservative; adjust if too sensitive.
-    return max > 0.02;
+    return max;
   }
 
-  function updateHandsFreeUi() {
-    handsFreeBtn.textContent = handsFreeEnabled ? "Hands‑free: On" : "Hands‑free: Off";
-    handsFreeBtn.title = handsFreeEnabled
-      ? `Hands‑free listening is ON (wake phrase: \"${WAKE_PHRASE}\")`
-      : "Toggle hands-free listening";
-
-    micBtn.disabled = handsFreeEnabled;
-    if (!recording) {
-      micBtn.title = handsFreeEnabled ? "Hands‑free is on (use wake phrase)" : "Click to record";
+  function getSelectedMicLabel() {
+    try {
+      const opt = micDeviceSelect && micDeviceSelect.options ? micDeviceSelect.options[micDeviceSelect.selectedIndex] : null;
+      return opt && opt.textContent ? opt.textContent : "Mic: Default";
+    } catch (e) {
+      return "Mic: Default";
     }
   }
 
-  function addBubble(text, role) {
-    const div = document.createElement("div");
-    div.className = `bubble ${role}`;
-    div.textContent = text;
-    chat.appendChild(div);
-    chat.scrollTop = chat.scrollHeight;
+  function startHandsFreeMeter() {
+    if (!micMeterFill) return;
+    if (handsFreeMeterRaf) cancelAnimationFrame(handsFreeMeterRaf);
+    const tick = () => {
+      if (!handsFreeEnabled || !handsFreeAnalyser) {
+        micMeterFill.style.width = "0%";
+        handsFreeMeterRaf = 0;
+        return;
+      }
+      const rms = getRmsLevel(handsFreeAnalyser);
+      // Map rms to a visible percentage; clamp.
+      const pct = Math.max(0, Math.min(100, Math.round((rms / 0.08) * 100)));
+      micMeterFill.style.width = `${pct}%`;
+      handsFreeMeterRaf = requestAnimationFrame(tick);
+    };
+    handsFreeMeterRaf = requestAnimationFrame(tick);
+  }
+
+  function stopHandsFreeMeter() {
+    if (handsFreeMeterRaf) cancelAnimationFrame(handsFreeMeterRaf);
+    handsFreeMeterRaf = 0;
+    if (micMeterFill) micMeterFill.style.width = "0%";
+  }
+
+  function encodeWavFromFloat32(samplesFloat32, sampleRate) {
+    // 16-bit PCM mono WAV
+    const numSamples = samplesFloat32.length;
+    const bytesPerSample = 2;
+    const blockAlign = bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = numSamples * bytesPerSample;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    function writeAscii(offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+
+    writeAscii(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeAscii(8, "WAVE");
+    writeAscii(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, byteRate, true);
+    view.setUint16(32, blockAlign, true);
+    view.setUint16(34, 16, true);
+    writeAscii(36, "data");
+    view.setUint32(40, dataSize, true);
+
+    let offset = 44;
+    for (let i = 0; i < numSamples; i++) {
+      let s = samplesFloat32[i];
+      if (s > 1) s = 1;
+      if (s < -1) s = -1;
+      const int16 = s < 0 ? s * 0x8000 : s * 0x7fff;
+      view.setInt16(offset, int16, true);
+      offset += 2;
+    }
+    return buffer;
   }
 
   async function playAlfredVoice(text) {
@@ -395,45 +554,103 @@
     });
 
     if (!res.ok) {
-      throw new Error(await res.text());
+      const text = await res.text();
+      const err = new Error(text);
+      err.status = res.status;
+      throw err;
     }
     return res.json();
   }
 
   async function recordOnceFromStream(stream, durationMs) {
-    return new Promise((resolve, reject) => {
-      let localChunks = [];
-      let localRecorder;
+    // Try MediaRecorder first; if it fails, fall back to WAV via WebAudio.
+    if (window.MediaRecorder) {
       try {
-        localRecorder = new MediaRecorder(stream);
+        return await new Promise((resolve, reject) => {
+          let localChunks = [];
+          let localRecorder;
+          const mimeType = pickMediaRecorderMimeType();
+          try {
+            localRecorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+          } catch (e) {
+            reject(e);
+            return;
+          }
+          localRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) localChunks.push(e.data);
+          };
+          localRecorder.onerror = (e) => reject(e);
+          localRecorder.onstop = () => {
+            resolve(new Blob(localChunks, { type: localRecorder.mimeType || "audio/webm" }));
+          };
+          try {
+            // timeslice helps ensure ondataavailable fires reliably across browsers
+            localRecorder.start(250);
+          } catch (e) {
+            reject(e);
+            return;
+          }
+          setTimeout(() => {
+            try { localRecorder.stop(); } catch (e) { reject(e); }
+          }, durationMs);
+        });
+      } catch (e) {
+        // fall through to WAV
+      }
+    }
+
+    // WAV fallback
+    return new Promise(async (resolve, reject) => {
+      let audioCtx;
+      try {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
       } catch (e) {
         reject(e);
         return;
       }
+      let source;
+      try {
+        source = audioCtx.createMediaStreamSource(stream);
+      } catch (e) {
+        try { await audioCtx.close(); } catch (_) {}
+        reject(e);
+        return;
+      }
 
-      localRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) localChunks.push(e.data);
-      };
-      localRecorder.onerror = (e) => reject(e);
-      localRecorder.onstop = () => {
-        const blob = new Blob(localChunks, { type: localRecorder.mimeType || "audio/webm" });
-        resolve(blob);
+      const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+      const samples = [];
+      let total = 0;
+
+      processor.onaudioprocess = (e) => {
+        const input = e.inputBuffer.getChannelData(0);
+        const copy = new Float32Array(input.length);
+        copy.set(input);
+        samples.push(copy);
+        total += copy.length;
       };
 
-      localRecorder.start();
-      setTimeout(() => {
-        try {
-          localRecorder.stop();
-        } catch (e) {
-          reject(e);
+      source.connect(processor);
+      processor.connect(audioCtx.destination);
+      try { await audioCtx.resume(); } catch (e) {}
+
+      setTimeout(async () => {
+        try { processor.disconnect(); source.disconnect(); } catch (e) {}
+        const merged = new Float32Array(total);
+        let offset = 0;
+        for (const chunk of samples) {
+          merged.set(chunk, offset);
+          offset += chunk.length;
         }
+        const wavBuffer = encodeWavFromFloat32(merged, audioCtx.sampleRate);
+        try { await audioCtx.close(); } catch (e) {}
+        resolve(new Blob([wavBuffer], { type: "audio/wav" }));
       }, durationMs);
     });
   }
 
   function extractWakeMessage(transcriptLower) {
-    // Accept small variations like "yo alfred" or "yoww alfred".
-    const re = /\byo+w\s+alfred\b/i;
+    // Accept small variations like "yo, alfred" or "yow-alfred".
+    const re = /\byo+w[\s,\.\-]+alfred\b/i;
     const m = transcriptLower.match(re);
     if (!m) return null;
     const idx = transcriptLower.indexOf(m[0].toLowerCase());
@@ -445,23 +662,64 @@
     if (!handsFreeEnabled || !handsFreeStream || handsFreeLoopBusy) return;
     handsFreeLoopBusy = true;
     try {
-      // When not actively expecting a command, avoid calling /stt during silence.
-      if (!handsFreeNextIsCommand) {
-        const likelySpeech = await isLikelySpeech();
-        if (!likelySpeech) return;
+      // Quick silence check to avoid spamming /stt with empty audio.
+      const maxRms = await sampleMaxRms(350);
+      if (maxRms !== null && maxRms < 0.003) {
+        handsFreeSilentStreak += 1;
+        // Only show a diagnostic occasionally.
+        if (handsFreeSilentStreak >= 3) {
+          const now = Date.now();
+          if (now - lastHandsFreeDiagAt > 10000) {
+            lastHandsFreeDiagAt = now;
+            let trackInfo = "";
+            try {
+              const t = handsFreeStream && handsFreeStream.getAudioTracks ? handsFreeStream.getAudioTracks()[0] : null;
+              const s = t && t.getSettings ? t.getSettings() : null;
+              if (s) trackInfo = ` settings=${JSON.stringify(s)}`;
+            } catch (e) {}
+            addBubble(
+              `⚠️ Hands‑free: mic input seems silent (maxRms=${maxRms.toFixed(4)}). ${getSelectedMicLabel()}${trackInfo}. If this stays near 0.0000, switch the mic dropdown or unmute the device in Windows Sound settings.`,
+              "alfred"
+            );
+          }
+        }
+        return;
       }
 
-      const blob = await recordOnceFromStream(handsFreeStream, 1200);
-      const data = await sttFromBlob(blob, "handsfree.webm");
+      const blob = await recordOnceFromStream(handsFreeStream, 1400);
+      if (!blob || blob.size < 2048) {
+        handsFreeSilentStreak += 1;
+        const now = Date.now();
+        if (now - lastHandsFreeDiagAt > 10000) {
+          lastHandsFreeDiagAt = now;
+          addBubble("⚠️ Hands‑free: captured almost no audio. Try speaking closer to the mic.", "alfred");
+        }
+        return;
+      }
+
+      handsFreeSilentStreak = 0;
+
+      const ext = (blob.type && blob.type.includes("ogg")) ? "ogg" : ((blob.type && blob.type.includes("mp4")) ? "mp4" : ((blob.type && blob.type.includes("wav")) ? "wav" : "webm"));
+      const data = await sttFromBlob(blob, `handsfree.${ext}`);
       const transcript = (data && data.text ? String(data.text) : "").trim();
       const transcriptLower = transcript.toLowerCase();
+      if (!transcript) {
+        const now = Date.now();
+        if (now - lastHandsFreeDiagAt > 10000) {
+          lastHandsFreeDiagAt = now;
+          addBubble(
+            `⚠️ Hands‑free: STT returned empty text (audio type=${blob.type || "unknown"}, bytes=${blob.size}).`,
+            "alfred"
+          );
+        }
+        return;
+      }
 
-      if (!transcript) return;
+      handsFreeBackoffMs = 500;
 
-      // Voice commands should work anytime.
+      // Allow voice control of TTS anytime.
       if (handleVoiceControlCommand(transcript)) return;
 
-      // If we already heard the wake word, next transcript becomes the command.
       if (handsFreeNextIsCommand) {
         handsFreeNextIsCommand = false;
         input.value = transcript;
@@ -469,28 +727,34 @@
         return;
       }
 
-      // Wake word routing.
       const wake = extractWakeMessage(transcriptLower);
       if (!wake) return;
 
-      // If the user said: "yow alfred <message>", use the remainder.
       if (wake.after) {
-        input.value = transcript.replace(new RegExp(wake.wake, "i"), "").trim();
+        input.value = transcript.replace(new RegExp(escapeRegExp(wake.wake), "i"), "").trim();
         if (input.value) form.dispatchEvent(new Event("submit"));
         return;
       }
 
-      // If only wake phrase was detected, treat the next chunk as the command.
       handsFreeNextIsCommand = true;
     } catch (err) {
       console.error("Hands-free STT loop error:", err);
-      setHandsFree(false);
-      addBubble("⚠️ Hands‑free stopped (STT error).", "alfred");
+      const status = (err && typeof err === "object" && "status" in err) ? err.status : null;
+      const msg = (err && err.message) ? String(err.message) : String(err);
+      const shortMsg = msg.length > 220 ? msg.slice(0, 220) + "…" : msg;
+
+      // Stop on clear auth/key failures; otherwise retry with backoff.
+      if (status === 401 || status === 403 || (status === 500 && shortMsg.toLowerCase().includes("api key"))) {
+        setHandsFree(false);
+        addBubble(`⚠️ Hands‑free stopped (STT unavailable): ${shortMsg}`, "alfred");
+        return;
+      }
+
+      handsFreeBackoffMs = status === 429 ? 6000 : 2500;
+      addBubble(`⚠️ Hands‑free STT error (retrying)${status ? ` [${status}]` : ""}: ${shortMsg}`, "alfred");
     } finally {
       handsFreeLoopBusy = false;
-      if (handsFreeEnabled) {
-        setTimeout(handsFreeLoop, 400);
-      }
+      if (handsFreeEnabled) setTimeout(handsFreeLoop, handsFreeBackoffMs);
     }
   }
 
@@ -498,20 +762,25 @@
     if (enabled === handsFreeEnabled) return;
 
     if (enabled) {
-      if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      if (!navigator.mediaDevices?.getUserMedia) {
         addBubble("⚠️ Hands‑free not supported in this browser.", "alfred");
         return;
       }
+      if (!ensureMicSecureContext()) return;
 
       try {
-        // Stop any manual recording first.
+        // Stop manual recording first.
         if (recorder && recording) {
           try { recorder.stop(); } catch (e) {}
         }
+        handsFreeStream = await navigator.mediaDevices.getUserMedia({
+          audio: buildAudioConstraints(),
+        });
 
-        handsFreeStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // After permission is granted, refresh device list so labels appear.
+        refreshMicDeviceList();
 
-        // Set up analyser for a simple volume check.
+        // Set up analyser so we can detect silence (and diagnose “mic works but Alfred hears nothing”).
         try {
           handsFreeAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
           handsFreeSource = handsFreeAudioCtx.createMediaStreamSource(handsFreeStream);
@@ -520,18 +789,18 @@
           handsFreeSource.connect(handsFreeAnalyser);
           await handsFreeAudioCtx.resume();
         } catch (e) {
-          // If WebAudio fails, we still can run hands-free without VAD.
           handsFreeAudioCtx = null;
           handsFreeSource = null;
           handsFreeAnalyser = null;
         }
-
+        startHandsFreeMeter();
         handsFreeEnabled = true;
         handsFreeNextIsCommand = false;
+        handsFreeSilentStreak = 0;
         updateHandsFreeUi();
         handsFreeLoop();
-      } catch (err) {
-        console.error("Hands-free mic permission error:", err);
+      } catch (e) {
+        console.error("Hands-free mic permission error:", e);
         addBubble("⚠️ Microphone permission denied.", "alfred");
         handsFreeEnabled = false;
         handsFreeStream = null;
@@ -543,6 +812,7 @@
     // disable
     handsFreeEnabled = false;
     handsFreeNextIsCommand = false;
+    handsFreeSilentStreak = 0;
     try {
       if (handsFreeAudioCtx) {
         handsFreeAudioCtx.close();
@@ -551,59 +821,96 @@
     handsFreeAudioCtx = null;
     handsFreeSource = null;
     handsFreeAnalyser = null;
+    stopHandsFreeMeter();
     try {
-      if (handsFreeStream) {
-        handsFreeStream.getTracks().forEach((t) => t.stop());
-      }
+      if (handsFreeStream) handsFreeStream.getTracks().forEach((t) => t.stop());
     } catch (e) {}
     handsFreeStream = null;
     updateHandsFreeUi();
   }
 
   async function startRecording() {
-    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    if (!navigator.mediaDevices?.getUserMedia) {
       micBtn.disabled = true;
       micBtn.title = "Voice recording not supported in this browser";
       return;
     }
+    if (!ensureMicSecureContext()) return;
 
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    chunks = [];
-    recorder = new MediaRecorder(stream);
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: buildAudioConstraints(),
+    });
 
-    recorder.ondataavailable = (e) => {
-      if (e.data && e.data.size > 0) chunks.push(e.data);
-    };
+    // After permission is granted, refresh device list so labels appear.
+    refreshMicDeviceList();
 
-    recorder.onstop = async () => {
-      try {
-        stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
-        const data = await sttFromBlob(blob, "mic.webm");
-        const transcript = (data && data.text ? String(data.text) : "").trim();
-        if (!transcript) {
-          addBubble("⚠️ No transcript returned.", "alfred");
-          return;
+    // Prefer MediaRecorder for manual mic; fall back to recordOnceFromStream.
+    if (window.MediaRecorder) {
+      chunks = [];
+      const mimeType = pickMediaRecorderMimeType();
+      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+
+      recorder.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = async () => {
+        try {
+          stream.getTracks().forEach((t) => t.stop());
+          const blob = new Blob(chunks, { type: recorder.mimeType || "audio/webm" });
+          const ext = (blob.type && blob.type.includes("ogg")) ? "ogg" : ((blob.type && blob.type.includes("mp4")) ? "mp4" : "webm");
+          const data = await sttFromBlob(blob, `mic.${ext}`);
+          const transcript = (data && data.text ? String(data.text) : "").trim();
+          if (!transcript) {
+            addBubble("⚠️ No transcript returned.", "alfred");
+            return;
+          }
+
+          if (handleVoiceControlCommand(transcript)) return;
+          input.value = transcript;
+          form.dispatchEvent(new Event("submit"));
+        } catch (err) {
+          console.error("STT error:", err);
+          const status = (err && typeof err === "object" && "status" in err) ? err.status : null;
+          const msg = (err && err.message) ? String(err.message) : String(err);
+          const shortMsg = msg.length > 220 ? msg.slice(0, 220) + "…" : msg;
+          addBubble(`⚠️ Error transcribing audio (STT)${status ? ` [${status}]` : ""}: ${shortMsg}`, "alfred");
+        } finally {
+          setMicUiActive(false);
+          recorder = null;
         }
+      };
 
-        // Voice-operated equivalents: allow voice control of TTS playback.
-        if (handleVoiceControlCommand(transcript)) {
-          return;
-        }
+      recorder.start(250);
+      setMicUiActive(true);
+      return;
+    }
 
-        input.value = transcript;
-        form.dispatchEvent(new Event("submit"));
-      } catch (err) {
-        console.error("STT error:", err);
-        addBubble("⚠️ Error transcribing audio (STT).", "alfred");
-      } finally {
-        setMicUiActive(false);
-        recorder = null;
+    // Fallback path
+    try {
+      setMicUiActive(true);
+      const blob = await recordOnceFromStream(stream, 1800);
+      stream.getTracks().forEach((t) => t.stop());
+      const data = await sttFromBlob(blob, "mic.wav");
+      const transcript = (data && data.text ? String(data.text) : "").trim();
+      if (!transcript) {
+        addBubble("⚠️ No transcript returned.", "alfred");
+        return;
       }
-    };
-
-    recorder.start();
-    setMicUiActive(true);
+      if (handleVoiceControlCommand(transcript)) return;
+      input.value = transcript;
+      form.dispatchEvent(new Event("submit"));
+    } catch (err) {
+      console.error("STT error:", err);
+      const status = (err && typeof err === "object" && "status" in err) ? err.status : null;
+      const msg = (err && err.message) ? String(err.message) : String(err);
+      const shortMsg = msg.length > 220 ? msg.slice(0, 220) + "…" : msg;
+      addBubble(`⚠️ Error transcribing audio (STT)${status ? ` [${status}]` : ""}: ${shortMsg}`, "alfred");
+    } finally {
+      setMicUiActive(false);
+      recorder = null;
+      try { stream.getTracks().forEach((t) => t.stop()); } catch (e) {}
+    }
   }
 
   function stopRecording() {
@@ -630,47 +937,17 @@
     await setHandsFree(!handsFreeEnabled);
   });
 
-  // Gesture: double-click / double-tap header toggles hands-free.
-  (function initHandsFreeGesture() {
-    const headerEl = document.querySelector("header");
-    if (!headerEl) return;
+  micDeviceSelect.addEventListener("change", async () => {
+    selectedMicDeviceId = micDeviceSelect.value || "";
+    try {
+      if (selectedMicDeviceId) localStorage.setItem(MIC_DEVICE_STORAGE_KEY, selectedMicDeviceId);
+      else localStorage.removeItem(MIC_DEVICE_STORAGE_KEY);
+    } catch (e) {}
 
-    headerEl.addEventListener("dblclick", () => setHandsFree(!handsFreeEnabled));
-
-    let lastTap = 0;
-    headerEl.addEventListener(
-      "touchend",
-      () => {
-        const now = Date.now();
-        if (now - lastTap < 350) {
-          setHandsFree(!handsFreeEnabled);
-          lastTap = 0;
-        } else {
-          lastTap = now;
-        }
-      },
-      { passive: true }
-    );
-  })();
-
-  // Keyboard accessibility (when not typing):
-  // - Esc: stop speaking
-  // - P: pause
-  // - R: resume
-  // - H: toggle hands-free
-  document.addEventListener("keydown", (e) => {
-    const tag = (e.target && e.target.tagName) ? e.target.tagName.toLowerCase() : "";
-    const typing = tag === "input" || tag === "textarea";
-    if (typing) return;
-
-    if (e.key === "Escape") {
-      stopTts();
-    } else if (e.key === "p" || e.key === "P") {
-      pauseTts();
-    } else if (e.key === "r" || e.key === "R") {
-      resumeTts();
-    } else if (e.key === "h" || e.key === "H") {
-      setHandsFree(!handsFreeEnabled);
+    // If hands-free is running, restart it to apply the new device.
+    if (handsFreeEnabled) {
+      await setHandsFree(false);
+      await setHandsFree(true);
     }
   });
 
@@ -678,6 +955,11 @@
   setMicUiActive(false);
   setTtsControls({ active: false, paused: false });
   updateHandsFreeUi();
+  try { selectedMicDeviceId = localStorage.getItem(MIC_DEVICE_STORAGE_KEY) || ""; } catch (e) { selectedMicDeviceId = ""; }
+  refreshMicDeviceList();
+  if (navigator.mediaDevices?.addEventListener) {
+    navigator.mediaDevices.addEventListener("devicechange", refreshMicDeviceList);
+  }
   addBubble("Hello, I'm Alfred. You can type or tap 🎤 to talk to me.", "alfred");
   </script>
 </body>
